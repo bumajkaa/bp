@@ -1,101 +1,134 @@
-from bcc import BPF
-import time
-import signal
+#!/usr/bin/env python3
 import sys
-sys.path.append('/home/alexandra/.local/lib/python3.9/site-packages')
-import keyboard
+import ctypes
+import time
+from collections import defaultdict
 
-# eBPF программа (оставлена без изменений)
-bpf_program = """
-#include <uapi/linux/ptrace.h>
-#include <linux/sched.h>
+# Структура регистров процессора для ptrace
+class user_regs_struct(ctypes.Structure):
+    _fields_ = [
+        ("r15", ctypes.c_ulonglong),
+        ("r14", ctypes.c_ulonglong),
+        ("r13", ctypes.c_ulonglong),
+        ("r12", ctypes.c_ulonglong),
+        ("rbp", ctypes.c_ulonglong),
+        ("rbx", ctypes.c_ulonglong),
+        ("r11", ctypes.c_ulonglong),
+        ("r10", ctypes.c_ulonglong),
+        ("r9", ctypes.c_ulonglong),
+        ("r8", ctypes.c_ulonglong),
+        ("rax", ctypes.c_ulonglong),
+        ("rcx", ctypes.c_ulonglong),
+        ("rdx", ctypes.c_ulonglong),
+        ("rsi", ctypes.c_ulonglong),
+        ("rdi", ctypes.c_ulonglong),
+        ("orig_rax", ctypes.c_ulonglong),  # Номер системного вызова
+        ("rip", ctypes.c_ulonglong),
+        ("cs", ctypes.c_ulonglong),
+        ("eflags", ctypes.c_ulonglong),
+        ("rsp", ctypes.c_ulonglong),
+        ("ss", ctypes.c_ulonglong),
+        ("fs_base", ctypes.c_ulonglong),
+        ("gs_base", ctypes.c_ulonglong),
+        ("ds", ctypes.c_ulonglong),
+        ("es", ctypes.c_ulonglong),
+        ("fs", ctypes.c_ulonglong),
+        ("gs", ctypes.c_ulonglong),
+    ]
 
-struct syscall_data_t {
-    u64 pid;
-    u64 duration_ns;
-    char comm[TASK_COMM_LEN];
-};
+# Константы ptrace
+PTRACE_TRACEME = 0
+PTRACE_GETREGS = 12
+PTRACE_SYSCALL = 24
 
-BPF_HASH(start, u64, u64);
-BPF_PERF_OUTPUT(events);
+# Загрузка libc
+libc = ctypes.CDLL("libc.so.6")
 
-int syscall_entry(struct pt_regs *ctx) {
-    u64 pid = bpf_get_current_pid_tgid();
-    u64 ts = bpf_ktime_get_ns();
-    start.update(&pid, &ts);
-    return 0;
+# Настройка функций libc
+libc.ptrace.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+libc.ptrace.restype = ctypes.c_long
+libc.fork.restype = ctypes.c_int
+libc.waitpid.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+
+# Словарь с именами системных вызовов (для x86_64)
+SYSCALL_NAMES = {
+    0: "read",
+    1: "write",
+    2: "open",
+    3: "close",
+    4: "stat",
+    5: "fstat",
+    9: "mmap",
+    10: "mprotect",
+    11: "munmap",
+    12: "brk",
+    21: "access",
+    59: "execve",
+    60: "exit",
+    63: "uname",
+    158: "arch_prctl",
+    231: "exit_group",
+    # Добавьте другие вызовы по необходимости
 }
 
-int syscall_exit(struct pt_regs *ctx) {
-    u64 pid = bpf_get_current_pid_tgid();
-    u64 *tsp = start.lookup(&pid);
-    if (tsp == 0) {
-        return 0;
-    }
+def trace_process(pid):
+    stats = defaultdict(list)
+    regs = user_regs_struct()
+    status = ctypes.c_int()
 
-    u64 duration_ns = bpf_ktime_get_ns() - *tsp;
-    start.delete(&pid);
+    print(f"\n🔍 Tracing PID: {pid}")
+    print(f"🖥️ Command: {' '.join(sys.argv[1:])}\n")
 
-    struct syscall_data_t data = {};
-    data.pid = pid >> 32;
-    data.duration_ns = duration_ns;
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    while True:
+        # Ожидание системного вызова
+        libc.ptrace(PTRACE_SYSCALL, pid, None, None)
+        libc.waitpid(pid, ctypes.byref(status), 0)
 
-    events.perf_submit(ctx, &data, sizeof(data));
-    return 0;
-}
-"""
+        if (status.value >> 8) == (0x7F << 8 | 0x00):  # Проверка на остановку
+            # Получение регистров
+            libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(regs))
+            syscall_num = regs.orig_rax
 
-# Флаг для управления циклом
-running = True
+            # Замер времени выполнения
+            start = time.monotonic()
+            libc.ptrace(PTRACE_SYSCALL, pid, None, None)
+            libc.waitpid(pid, ctypes.byref(status), 0)
+            end = time.monotonic()
 
-# Обработчик сигнала для Ctrl+C
-def signal_handler(sig, frame):
-    global running
-    print("\nCtrl+C pressed, exiting...")
-    running = False
+            elapsed = (end - start) * 1000  # мс
+            stats[syscall_num].append(elapsed)
+        else:
+            break  # Процесс завершился
 
-# Привязка обработчика сигнала
-signal.signal(signal.SIGINT, signal_handler)
+    return stats
 
-# Загрузка eBPF программы
-b = BPF(text=bpf_program)
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: sudo {sys.argv[0]} <program> [args...]")
+        print("Example: sudo ./syscall_tracer.py ls -l")
+        sys.exit(1)
 
-# Привязка к системным вызовам
-b.attach_kprobe(event="__x64_sys_read", fn_name="syscall_entry")
-b.attach_kretprobe(event="__x64_sys_read", fn_name="syscall_exit")
-b.attach_kprobe(event="__x64_sys_write", fn_name="syscall_entry")
-b.attach_kretprobe(event="__x64_sys_write", fn_name="syscall_exit")
+    # Создание дочернего процесса
+    pid = libc.fork()
+    if pid == 0:
+        # Дочерний процесс: запуск трассировки
+        libc.ptrace(PTRACE_TRACEME, 0, None, None)
+        
+        # Подготовка аргументов для execvp
+        args = [ctypes.create_string_buffer(arg.encode()) for arg in sys.argv[1:]]
+        argv = (ctypes.c_char_p * len(args))(*[arg.raw for arg in args])
+        
+        libc.execvp(args[0], argv)
+        print("❌ Failed to execute program!")
+        sys.exit(1)
+    else:
+        # Родительский процесс: трассировка
+        stats = trace_process(pid)
 
-# Функция для обработки событий
-def print_event(cpu, data, size):
-    event = b["events"].event(data)
-    print(f"PID: {event.pid}, Comm: {event.comm.decode()}, Duration: {event.duration_ns} ns")
-
-# Подписка на события
-b["events"].open_perf_buffer(print_event)
-
-print("Tracing syscalls... Press 'q' to quit or Ctrl+C")
-
-# Основной цикл
-while running:
-    try:
-        # Обработка событий eBPF
-        b.perf_buffer_poll(timeout=100)  # Таймаут 100 мс
-
-        # Проверка нажатия клавиши 'q'
-        if keyboard.is_pressed('q'):
-            print("'q' pressed, exiting...")
-            running = False
-
-    except Exception as e:
-        print(f"Error occurred: {e}")
-        running = False
-
-# Очистка ресурсов
-b.detach_kprobe(event="__x64_sys_read")
-b.detach_kretprobe(event="__x64_sys_read")
-b.detach_kprobe(event="__x64_sys_write")
-b.detach_kretprobe(event="__x64_sys_write")
-
-print("Program stopped cleanly.")
+        # Вывод статистики
+        print("\n📊 System Call Statistics")
+        print("=" * 70)
+        print(f"{'Syscall':<15} {'Name':<15} {'Count':<8} {'Max (ms)':<10} {'Min (ms)':<10} {'Avg (ms)':<10}")
+        print("-" * 70)
+        
+        for num, times in sorted(stats.
